@@ -29,6 +29,7 @@ import (
 	v1 "github.com/flanksource/canary-checker/api/v1"
 	"github.com/flanksource/canary-checker/pkg"
 	"github.com/flanksource/commons/collections"
+	"github.com/flanksource/commons/logger"
 )
 
 const (
@@ -101,6 +102,10 @@ func (c *KubernetesResourceChecker) check(ctx context.Context, check v1.Kubernet
 		})
 	}
 
+	// The run identity and pinned canary spec version are established before
+	// namespace completion so every subsequent phase shares one lifecycle.
+	run := newResourceRun(ctx.Canary, check.GetName())
+
 	if check.HasResourcesWithMissingNamespace() {
 		namespacedResources, err := fetchNamespacedResources(ctx)
 		if err != nil {
@@ -112,7 +117,7 @@ func (c *KubernetesResourceChecker) check(ctx context.Context, check v1.Kubernet
 
 	check.SetCanaryOwnerReference(ctx.Canary)
 
-	if err := templateKubernetesResourceCheck(ctx.Canary.GetPersistedID(), ctx.Canary.GetCheckID(check.GetName()), &check); err != nil {
+	if err := templateKubernetesResourceCheck(run, &check); err != nil {
 		return results.Failf("templating error: %v", err)
 	}
 
@@ -123,50 +128,100 @@ func (c *KubernetesResourceChecker) check(ctx context.Context, check v1.Kubernet
 
 	kClient := kommons.NewClient(k8sClient.RestConfig(), ctx.Logger)
 
-	for i := range check.StaticResources {
-		resource := check.StaticResources[i]
+	for i := range run.staticResources {
+		resource := run.staticResources[i]
 		if err := kClient.ApplyUnstructured(resource.GetNamespace(), &resource); err != nil {
 			return results.Failf("failed to apply static resource %s: %v", resource.GetName(), err)
 		}
 	}
 
 	defer func() {
-		if err := DeleteResources(ctx, check, false); err != nil {
-			results.Failf("failed to delete resources: %s", err)
+		// Local runs without a persistent identity keep the legacy cleanup
+		// behaviour exactly.
+		if !run.identified() {
+			if err := DeleteResources(ctx, check, false); err != nil {
+				results.Failf("failed to delete resources: %s", err)
+			}
+			return
+		}
+
+		// Cleanup is scoped to this run's own objects and runs on a context
+		// detached from cancellation/deadlines so timeout and cancellation still
+		// complete this run's cleanup. A confirmed check result is retained:
+		// cleanup continues best effort and never re-runs external checks;
+		// leftovers are reclaimed by a later run's fenced orphan sweep.
+		cleanupErr := run.cleanup(detachContext(&ctx), ctx, check.WaitFor.Delete)
+		run.stopHeartbeat()
+		if cleanupErr != nil {
+			logger.Errorf("failed to delete resources for run %s: %v", run.runID, cleanupErr)
+			if result.Pass {
+				result.AddData(map[string]any{"cleanupError": cleanupErr.Error()})
+			}
 		}
 	}()
 
-	if check.ClearResources {
+	if run.identified() {
+		if check.ClearResources {
+			// Only this run's own temporary objects may be removed before
+			// applying; overlapping runs are never affected.
+			if err := run.cleanup(&ctx, ctx, false); err != nil {
+				return results.Failf("failed to delete resources on startup: %s", err)
+			}
+		}
+
+		// Reclaim objects left behind by crashed/cancelled runs, fenced by run
+		// identity so live or newer runs are never touched.
+		if err := run.sweepOrphanedResources(&ctx); err != nil {
+			ctx.Tracef("failed to sweep orphaned resources: %v", err)
+		}
+	} else if check.ClearResources {
 		if err := DeleteResources(ctx, check, false); err != nil {
-			results.Failf("failed to delete resources on startup: %s", err)
+			return results.Failf("failed to delete resources on startup: %s", err)
 		}
 	}
 
-	for i := range check.Resources {
-		resource := check.Resources[i]
+	for i := range run.resources {
+		resource := run.resources[i]
 		if err := kClient.ApplyUnstructured(resource.GetNamespace(), &resource); err != nil {
-			return results.Failf("failed to apply resource (%s/%s/%s): %v", resource.GetKind(), resource.GetNamespace(), resource.GetName(), err)
+			if !run.identified() {
+				return results.Failf("failed to apply resource (%s/%s/%s): %v", resource.GetKind(), resource.GetNamespace(), resource.GetName(), err)
+			}
+
+			// The apply response is uncertain (e.g. timeout after the object
+			// was persisted): reconcile against this run's object identity
+			// instead of blindly failing or re-applying.
+			ownership, verifyErr := run.verifyAppliedObject(ctx, k8sClient, resource)
+			if verifyErr != nil {
+				return results.Failf("failed to apply resource (%s/%s/%s): %v (identity verification failed: %v)", resource.GetKind(), resource.GetNamespace(), resource.GetName(), err, verifyErr)
+			}
+
+			switch ownership {
+			case applyOwned:
+				ctx.Tracef("apply response for %s was uncertain but the object was confirmed for run %s", getName(resource), run.runID)
+			case applyMissing:
+				return results.Failf("failed to apply resource (%s/%s/%s): %v", resource.GetKind(), resource.GetNamespace(), resource.GetName(), err)
+			case applyForeign:
+				return results.Failf("failed to apply resource (%s/%s/%s): an object exists but is owned by another overlapping run", resource.GetKind(), resource.GetNamespace(), resource.GetName())
+			}
 		}
+		run.markApplied(resource)
 	}
 
-	resourceMap := map[string]map[string]any{}
-	var healthMap map[string]health.HealthStatus
+	run.startHeartbeat(ctx, k8sClient)
+
 	if !check.WaitFor.Disable {
-		var err error
 		var resourceObjs []unstructured.Unstructured
-		if healthMap, resourceObjs, err = c.evalWaitFor(ctx, check); err != nil {
+		if run.ready, resourceObjs, err = c.evalWaitFor(ctx, run, check); err != nil {
 			return results.Failf("error in evaluating wait for: %v", err)
 		}
 
 		for _, r := range resourceObjs {
 			r.SetManagedFields(nil)
-			resourceMap[getName(r)] = r.Object
+			run.observed[getName(r)] = r.Object
 		}
 	}
 
 	ctx.Tracef("found %d checks to run", len(check.Checks))
-
-	displayPerCheck := map[string]string{}
 	for _, c := range check.Checks {
 		virtualCanary := v1.Canary{
 			ObjectMeta: metav1.ObjectMeta{
@@ -179,8 +234,8 @@ func (c *KubernetesResourceChecker) check(ctx context.Context, check v1.Kubernet
 
 		templater := gomplate.StructTemplater{
 			Values: map[string]any{
-				"staticResources": check.StaticResources,
-				"resources":       check.Resources,
+				"staticResources": run.staticResources,
+				"resources":       run.resources,
 			},
 			ValueFunctions: true,
 			IgnoreFields: map[string]string{
@@ -227,7 +282,7 @@ func (c *KubernetesResourceChecker) check(ctx context.Context, check v1.Kubernet
 
 			if retryErr == nil {
 				for _, r := range res {
-					displayPerCheck[r.Check.GetName()] = r.Message
+					run.display[r.Check.GetName()] = r.Message
 				}
 				break
 			}
@@ -242,14 +297,14 @@ func (c *KubernetesResourceChecker) check(ctx context.Context, check v1.Kubernet
 	}
 
 	result.AddData(map[string]any{
-		"health":    healthMap,
-		"resources": resourceMap,
-		"display":   displayPerCheck,
+		"health":    run.ready,
+		"resources": run.observed,
+		"display":   run.display,
 	})
 	return results
 }
 
-func (c *KubernetesResourceChecker) evalWaitFor(ctx context.Context, check v1.KubernetesResourceCheck) (map[string]health.HealthStatus, []unstructured.Unstructured, error) {
+func (c *KubernetesResourceChecker) evalWaitFor(ctx context.Context, run *resourceRun, check v1.KubernetesResourceCheck) (map[string]health.HealthStatus, []unstructured.Unstructured, error) {
 	healthMap := make(map[string]health.HealthStatus)
 	waitTimeout, _ := check.WaitFor.Timeout.GetDurationOr(resourceWaitTimeoutDefault)
 	waitInterval, _ := check.WaitFor.Interval.GetDurationOr(resourceWaitIntervalDefault)
@@ -281,6 +336,21 @@ func (c *KubernetesResourceChecker) evalWaitFor(ctx context.Context, check v1.Ku
 			}
 
 			return fmt.Errorf("unexpected error. expected %d resources, got %d (%s)", check.TotalResources(), len(resourceObjs), strings.Join(got, ","))
+		}
+
+		// Every observed ephemeral object must still carry this run's
+		// identity. An overlapping run that has re-applied the same object
+		// names re-labels them; waiting on or checking another run's objects
+		// would be unsafe, so stop without retrying.
+		for i := range resourceObjs {
+			r := &resourceObjs[i]
+			if r.GetLabels()[resourceLabelKey("is-static")] == "true" {
+				continue
+			}
+			if !run.ownedByRun(*r) {
+				owner := r.GetLabels()[runIDLabel]
+				return fmt.Errorf("resource %s is owned by another run (%s), aborting to avoid interfering with an overlapping run", getName(*r), owner)
+			}
 		}
 
 		waitForExpr := check.WaitFor.Expr
@@ -491,13 +561,30 @@ func DeleteResources(ctx context.Context, check v1.KubernetesResourceCheck, dele
 	}
 }
 
-func templateKubernetesResourceCheck(canaryID, checkID string, check *v1.KubernetesResourceCheck) error {
+func templateKubernetesResourceCheck(run *resourceRun, check *v1.KubernetesResourceCheck) error {
 	templater := gomplate.StructTemplater{
 		ValueFunctions: true,
 		DelimSets: []gomplate.Delims{
 			{Left: "{{", Right: "}}"},
 			{Left: "$(", Right: ")"},
 		},
+	}
+
+	runLabels := map[string]string{
+		resourceLabelKey("canary-id"): run.canaryID,
+		resourceLabelKey("check-id"):  run.checkID,
+	}
+	if run.identified() {
+		runLabels[runIDLabel] = run.runID
+		if run.generation > 0 {
+			runLabels[specGenerationLabel] = specGenerationLabelValue(run.generation)
+		}
+	}
+
+	runAnnotations := map[string]string{}
+	if run.identified() {
+		runAnnotations[runStartedAtAnnotation] = run.startedAtString()
+		runAnnotations[runHeartbeatAnnotation] = run.startedAtString()
 	}
 
 	for i, r := range check.Resources {
@@ -509,11 +596,10 @@ func templateKubernetesResourceCheck(canaryID, checkID string, check *v1.Kuberne
 		if r.GetNamespace() != namespace || r.GetObjectKind().GroupVersionKind() != kind {
 			return fmt.Errorf("templating the namespace or group/version/kind of a resource is not allowed")
 		}
-		newLabels := collections.MergeMap(r.GetLabels(), map[string]string{
-			resourceLabelKey("canary-id"): canaryID,
-			resourceLabelKey("check-id"):  checkID,
-		})
-		r.SetLabels(newLabels)
+		r.SetLabels(collections.MergeMap(r.GetLabels(), runLabels))
+		if run.identified() {
+			r.SetAnnotations(collections.MergeMap(r.GetAnnotations(), runAnnotations))
+		}
 		check.Resources[i] = r
 	}
 
@@ -527,14 +613,19 @@ func templateKubernetesResourceCheck(canaryID, checkID string, check *v1.Kuberne
 			return fmt.Errorf("templating the namespace or group/version/kind of a resource is not allowed")
 		}
 
-		newLabels := collections.MergeMap(r.GetLabels(), map[string]string{
-			resourceLabelKey("canary-id"): canaryID,
-			resourceLabelKey("check-id"):  checkID,
+		// Static resources are shared across runs and only deleted with the
+		// canary, so they never carry run identity labels or heartbeats.
+		staticLabels := map[string]string{
+			resourceLabelKey("canary-id"): run.canaryID,
+			resourceLabelKey("check-id"):  run.checkID,
 			resourceLabelKey("is-static"): "true",
-		})
-		r.SetLabels(newLabels)
+		}
+		r.SetLabels(collections.MergeMap(r.GetLabels(), staticLabels))
 		check.StaticResources[i] = r
 	}
+
+	run.resources = check.Resources
+	run.staticResources = check.StaticResources
 
 	return nil
 }
