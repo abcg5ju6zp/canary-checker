@@ -11,8 +11,8 @@ import (
 	v1 "github.com/flanksource/canary-checker/api/v1"
 	"github.com/flanksource/canary-checker/checks"
 	"github.com/flanksource/canary-checker/pkg"
-	"github.com/flanksource/canary-checker/pkg/cache"
 	"github.com/flanksource/canary-checker/pkg/db"
+	"github.com/flanksource/canary-checker/pkg/publication"
 	"github.com/flanksource/canary-checker/pkg/runner"
 	"github.com/flanksource/canary-checker/pkg/utils"
 	"github.com/flanksource/commons/logger"
@@ -39,8 +39,6 @@ var (
 	MinimumTimeBetweenCanaryRuns = 10 * time.Second
 	FuncScheduler                = cron.New()
 )
-
-var CanaryStatusChannel chan CanaryStatusPayload
 
 var CanaryLastRuntimes = sync.Map{}
 
@@ -102,6 +100,10 @@ func (j CanaryJob) Run(ctx dutyjob.JobRuntime) error {
 		attribute.String("canary.namespace", j.Canary.Namespace),
 	)
 
+	if publication.ShouldGate(j.Canary, canaryCtx.HARCollector != nil) {
+		return j.runWithPublication(ctx, canaryID)
+	}
+
 	results, runMeta, err := checks.RunChecks(canaryCtx)
 	if err != nil {
 		return err
@@ -128,22 +130,68 @@ func (j CanaryJob) Run(ctx dutyjob.JobRuntime) error {
 		}
 	}
 
-	// Capture the cutoff before SaveResults so LatestCheckStatus excludes the
-	// current run's just-persisted status and compares against the prior state.
-	now := time.Now()
-
-	transformedChecksCreated, checkIDDeleteStrategyMap, err := SaveResults(ctx.Context, results)
+	transformedChecksCreated, checkIDDeleteStrategyMap, err := publication.SaveResults(ctx.Context, results)
 	if err != nil {
 		return fmt.Errorf("failed to save results: %w", err)
 	}
 
-	UpdateCanaryStatusAndEvent(ctx.Context, j.Canary, results, now)
+	publication.PublishK8sStatusLegacy(ctx.Context, j.Canary, results, time.Now())
 
+	reconcileTransformedChecks(ctx, canaryID, existingTransformedChecks, transformedChecksCreated, checkIDDeleteStrategyMap)
+
+	// Update last runtime map
+	CanaryLastRuntimes.Store(canaryID, time.Now())
+	ctx.History.SuccessCount = len(results)
+	return nil
+}
+
+// runWithPublication executes a gated run (attachments or HAR present)
+// through the recoverable publication protocol.
+func (j CanaryJob) runWithPublication(ctx dutyjob.JobRuntime, canaryID string) error {
+	runKey := publication.ScheduledRunKey(j.DBCanary.ID, j.Canary, time.Now())
+	outcome, err := publication.RunGated(ctx.Context, j.DBCanary, j.Canary, runKey, publication.TriggerScheduled)
+	if err != nil {
+		return err
+	}
+	if outcome == nil || outcome.Skipped {
+		return nil
+	}
+
+	if outcome.SecretLookupRateLimitSkipped > 0 {
+		maybeRescheduleAfterSecretLookupRateLimit(ctx.Context, j.DBCanary, j.Canary, outcome.SecretLookupRateLimitSkipped)
+	}
+
+	logPass := j.Canary.IsTrace() || j.Canary.IsDebug() || LogPass
+	logFail := j.Canary.IsTrace() || j.Canary.IsDebug() || LogFail
+	for _, result := range outcome.Results {
+		if logPass && result.Pass || logFail && !result.Pass {
+			ctx.Logger.Named(result.GetName()).Infof(result.String())
+		}
+	}
+
+	if !outcome.Reused && len(outcome.TransformedChecksCreated) > 0 {
+		existingTransformedChecks, err := db.GetTransformedCheckIDs(ctx.Context, canaryID, checks.WebhookCheckType)
+		if err != nil {
+			ctx.Error(err, "error getting transformed checks")
+		}
+		reconcileTransformedChecks(ctx, canaryID, existingTransformedChecks,
+			outcome.TransformedChecksCreated, outcome.CheckIDDeleteStrategyMap)
+	}
+
+	CanaryLastRuntimes.Store(canaryID, time.Now())
+	ctx.History.SuccessCount = len(outcome.Results)
+	return nil
+}
+
+// reconcileTransformedChecks applies the healthy/unhealthy placeholder
+// statuses and deletes transformed checks that the current run no longer
+// produces.
+func reconcileTransformedChecks(ctx dutyjob.JobRuntime, canaryID string, existing, created []string, deleteStrategy map[string]string) {
 	checkDeleteStrategyGroup := make(map[string][]string)
-	checkIDsToRemove := utils.SetDifference(existingTransformedChecks, transformedChecksCreated)
-	if len(checkIDsToRemove) > 0 && len(transformedChecksCreated) > 0 {
+	checkIDsToRemove := utils.SetDifference(existing, created)
+	if len(checkIDsToRemove) > 0 && len(created) > 0 {
 		for _, checkID := range checkIDsToRemove {
-			switch checkIDDeleteStrategyMap[checkID] {
+			switch deleteStrategy[checkID] {
 			case v1.OnTransformMarkHealthy:
 				checkDeleteStrategyGroup[models.CheckStatusHealthy] = append(
 					checkDeleteStrategyGroup[models.CheckStatusHealthy],
@@ -166,11 +214,6 @@ func (j CanaryJob) Run(ctx dutyjob.JobRuntime) error {
 			ctx.Error(err, "error deleting transformed checks for canary")
 		}
 	}
-
-	// Update last runtime map
-	CanaryLastRuntimes.Store(canaryID, time.Now())
-	ctx.History.SuccessCount = len(results)
-	return nil
 }
 
 func maybeRescheduleAfterSecretLookupRateLimit(ctx context.Context, dbCanary pkg.Canary, canary v1.Canary, skipped int) {
@@ -193,63 +236,6 @@ func maybeRescheduleAfterSecretLookupRateLimit(ctx context.Context, dbCanary pkg
 	}
 
 	ctx.Infof("scheduled earlier retry for canary[%s/%s] in %s after %d secret lookup rate-limited skips", canary.Namespace, canary.Name, delay.Round(time.Second), skipped)
-}
-
-func SaveResults(ctx context.Context, results []*pkg.CheckResult) ([]string, map[string]string, error) {
-	var transformedChecksCreated []string
-	// Transformed checks have a delete strategy
-	// On deletion they can either be marked healthy, unhealthy or left as is
-	checkIDDeleteStrategyMap := make(map[string]string)
-
-	if len(results) == 0 {
-		return transformedChecksCreated, checkIDDeleteStrategyMap, nil
-	}
-
-	tx := ctx.DB().Begin()
-	if tx.Error != nil {
-		return nil, nil, fmt.Errorf("error starting transaction: %w", tx.Error)
-	}
-	defer tx.Rollback()
-
-	for _, result := range results {
-		if result.HasCanary() {
-			for _, can := range result.CanaryResult {
-				m := can.ToModel()
-				canaryID, err := uuid.Parse(result.Canary.GetPersistedID())
-				if err != nil {
-					return nil, nil, fmt.Errorf("error getting canary_id: %w", err)
-				}
-				checkID, err := cache.PostgresCache.GetCheckID(ctx, canaryID, result.Check.GetType(), result.Check.GetName())
-				if err != nil {
-					return nil, nil, fmt.Errorf("error getting check_id: %w", err)
-				}
-				m.Source = fmt.Sprintf("check=%s", checkID)
-				if _, _, err := db.PersistCanaryModel(ctx.WithDB(tx, ctx.Pool()), m); err != nil {
-					return nil, nil, fmt.Errorf("error saving canary: %w", err)
-				}
-			}
-			continue
-		}
-
-		transformedChecksAdded, err := cache.PostgresCache.Add(
-			ctx.WithDB(tx, ctx.Pool()),
-			pkg.FromV1(result.Canary, result.Check),
-			pkg.CheckStatusFromResult(*result),
-		)
-		if err != nil {
-			return nil, nil, fmt.Errorf("error adding check to cache: %w", err)
-		}
-
-		transformedChecksCreated = append(transformedChecksCreated, transformedChecksAdded)
-		checkIDDeleteStrategyMap[transformedChecksAdded] = result.Check.GetTransformDeleteStrategy()
-
-		// Establish relationship with components & configs
-		if err := FormCheckRelationships(ctx.WithDB(tx, ctx.Pool()), result); err != nil {
-			ctx.Logger.Named(result.Name).Errorf("error forming check relationships: %v", err)
-		}
-	}
-
-	return transformedChecksCreated, checkIDDeleteStrategyMap, tx.Commit().Error
 }
 
 func logIfError(err error, description string) {

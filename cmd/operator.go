@@ -8,7 +8,7 @@ import (
 	apicontext "github.com/flanksource/canary-checker/api/context"
 	"github.com/flanksource/canary-checker/pkg/cache"
 	"github.com/flanksource/canary-checker/pkg/jobs"
-	canaryJobs "github.com/flanksource/canary-checker/pkg/jobs/canary"
+	"github.com/flanksource/canary-checker/pkg/publication"
 	"github.com/flanksource/canary-checker/pkg/runner"
 	"github.com/flanksource/canary-checker/pkg/utils"
 	"github.com/go-logr/logr"
@@ -171,7 +171,7 @@ func startControllers() error {
 
 	// Instantiate the canary status channel so the canary job can send updates on it.
 	// We are adding a small buffer to prevent blocking
-	canaryJobs.CanaryStatusChannel = make(chan canaryJobs.CanaryStatusPayload, 64)
+	publication.K8sStatusChannel = make(chan publication.K8sStatusPayload, 64)
 
 	// Listen for status updates
 	go canaryReconciler.Report()

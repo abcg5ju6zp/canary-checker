@@ -7,12 +7,11 @@ import (
 	"time"
 
 	"github.com/flanksource/canary-checker/api/context"
-	v1 "github.com/flanksource/canary-checker/api/v1"
 	"github.com/flanksource/canary-checker/checks"
 	"github.com/flanksource/canary-checker/pkg"
 	"github.com/flanksource/canary-checker/pkg/cache"
 	"github.com/flanksource/canary-checker/pkg/db"
-	canaryJobs "github.com/flanksource/canary-checker/pkg/jobs/canary"
+	"github.com/flanksource/canary-checker/pkg/publication"
 	pkgTopology "github.com/flanksource/canary-checker/pkg/topology"
 	dutyContext "github.com/flanksource/duty/context"
 	"github.com/labstack/echo/v4"
@@ -35,12 +34,14 @@ func RunCanaryHandler(c echo.Context) error {
 		return errorResponse(c, fmt.Errorf("check (%s) was not found", checkID), http.StatusNotFound)
 	}
 
-	var canary *v1.Canary
-	if canaryModel, err := db.FindCanaryByID(duty, check.CanaryID.String()); err != nil {
+	canaryModel, err := db.FindCanaryByID(duty, check.CanaryID.String())
+	if err != nil {
 		return errorResponse(c, err, http.StatusInternalServerError)
 	} else if canaryModel == nil {
 		return errorResponse(c, fmt.Errorf("canary (%s) was not found", check.CanaryID), http.StatusNotFound)
-	} else if canary, err = canaryModel.ToV1(); err != nil {
+	}
+	canary, err := canaryModel.ToV1()
+	if err != nil {
 		return errorResponse(c, err, http.StatusInternalServerError)
 	}
 
@@ -50,6 +51,22 @@ func RunCanaryHandler(c echo.Context) error {
 	}
 
 	ctx := context.New(duty, *canary)
+
+	if publication.ShouldGate(*canary, ctx.HARCollector != nil) {
+		runKey := publication.RunNowRunKey(checkID, c.Request().Header.Get("Idempotency-Key"))
+		outcome, err := publication.RunGated(duty, *canaryModel, *canary, runKey, publication.TriggerRunNow)
+		if err != nil {
+			return errorResponse(c, err, http.StatusInternalServerError)
+		}
+		if outcome == nil || outcome.Skipped {
+			return errorResponse(c, fmt.Errorf("an identical run is already in progress"), http.StatusConflict)
+		}
+		if len(outcome.Results) == 0 {
+			return nil
+		}
+		return c.JSON(http.StatusOK, outcome.Results[0])
+	}
+
 	results, _, err := checks.RunChecks(ctx)
 	if err != nil {
 		return errorResponse(c, err, http.StatusInternalServerError)
@@ -59,8 +76,6 @@ func RunCanaryHandler(c echo.Context) error {
 		return nil
 	}
 
-	// Capture the cutoff before persisting so LatestCheckStatus excludes the
-	// current run's just-saved status and compares against the prior state.
 	now := time.Now()
 
 	for _, result := range results {
@@ -68,12 +83,12 @@ func RunCanaryHandler(c echo.Context) error {
 			return errorResponse(c, err, http.StatusInternalServerError)
 		}
 
-		if err := canaryJobs.FormCheckRelationships(ctx.Context, result); err != nil {
+		if err := publication.FormCheckRelationships(ctx.Context, result); err != nil {
 			ctx.Logger.Named(result.Name).Errorf("error forming check relationships: %v", err)
 		}
 	}
 
-	canaryJobs.UpdateCanaryStatusAndEvent(ctx.Context, *canary, results, now)
+	publication.PublishK8sStatusLegacy(ctx.Context, *canary, results, now)
 	return c.JSON(http.StatusOK, results[0])
 }
 

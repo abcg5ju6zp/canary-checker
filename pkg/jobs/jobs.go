@@ -5,6 +5,7 @@ import (
 
 	"github.com/flanksource/canary-checker/pkg/db"
 	canaryJobs "github.com/flanksource/canary-checker/pkg/jobs/canary"
+	"github.com/flanksource/canary-checker/pkg/publication"
 	topologyJobs "github.com/flanksource/canary-checker/pkg/jobs/topology"
 	"github.com/flanksource/canary-checker/pkg/runner"
 	"github.com/flanksource/canary-checker/pkg/topology"
@@ -59,6 +60,7 @@ func Start() {
 		canaryJobs.CleanupDeletedCanaryChecks,
 		canaryJobs.VacuumCanaryTables, canaryJobs.DeleteTransformedCanaries,
 		canaryJobs.SyncAgentSelectorCanaries, canaryJobs.CleanupOrphanedAgentSelectorCanaries,
+		publication.RecoverCheckRunPublications,
 	}
 	for _, j := range miscJobs {
 		job := j

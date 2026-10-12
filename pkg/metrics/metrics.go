@@ -161,39 +161,76 @@ func GetMetrics(key string) (uptime types.Uptime, latency types.Latency) {
 	return
 }
 
+// RecordSnapshot is the serializable subset of a check result needed to
+// record its aggregate metrics. It lets a recovered publication replay the
+// metrics output without re-executing the external check.
+type RecordSnapshot struct {
+	Name          string
+	CheckType     string
+	Endpoint      string
+	Labels        map[string]string
+	Duration      int64
+	Pass          bool
+	Invalid       bool
+	InternalError bool
+	Metrics       []pkg.Metric
+}
+
+// SnapshotResult builds the metrics snapshot of a live check result.
+func SnapshotResult(canary v1.Canary, result *pkg.CheckResult) RecordSnapshot {
+	return RecordSnapshot{
+		Name:          result.Check.GetName(),
+		CheckType:     result.Check.GetType(),
+		Endpoint:      canary.GetDescription(result.Check),
+		Labels:        result.Check.GetLabels(),
+		Duration:      result.Duration,
+		Pass:          result.Pass,
+		Invalid:       result.Invalid,
+		InternalError: result.InternalError,
+		Metrics:       result.Metrics,
+	}
+}
+
 func Record(
 	ctx context.Context,
 	canary v1.Canary,
 	result *pkg.CheckResult,
 ) (_uptime types.Uptime, _latency types.Latency) {
-	defer func() {
-		e := recover()
-		if e != nil {
-			ctx.Errorf("panic recording metrics for %s ==> %s", result, e)
-		}
-	}()
-
 	if result == nil || result.Check == nil {
 		ctx.Warnf("returned a nil result")
 		return _uptime, _latency
 	}
+	return RecordSnap(ctx, canary, SnapshotResult(canary, result))
+}
 
-	if canary.GetCheckID(result.Check.GetName()) == "" {
-		if val := result.Canary.Labels["transformed"]; val != "true" {
-			ctx.Warnf("%s returned a result for a check that does not exist", result.Check.GetName())
+func RecordSnap(
+	ctx context.Context,
+	canary v1.Canary,
+	result RecordSnapshot,
+) (_uptime types.Uptime, _latency types.Latency) {
+	defer func() {
+		e := recover()
+		if e != nil {
+			ctx.Errorf("panic recording metrics for %s ==> %s", result.Name, e)
+		}
+	}()
+
+	if canary.GetCheckID(result.Name) == "" {
+		if val := result.Labels["transformed"]; val != "true" {
+			ctx.Warnf("%s returned a result for a check that does not exist", result.Name)
 		}
 		return _uptime, _latency
 	}
 
 	canaryNamespace := canary.Namespace
 	canaryName := canary.Name
-	name := result.Check.GetName()
-	checkType := result.Check.GetType()
-	endpoint := canary.GetDescription(result.Check)
+	name := result.Name
+	checkType := result.CheckType
+	endpoint := result.Endpoint
 	owner := canary.Spec.Owner
 	severity := canary.Spec.Severity
 	// We are recording aggreated metrics at the canary level, not the individual check level
-	key := canary.GetCheckID(result.Check.GetName())
+	key := canary.GetCheckID(result.Name)
 	var fail, pass, latency *rolling.TimePolicy
 
 	_fail, ok := failed.Get(key)
@@ -222,7 +259,7 @@ func Record(
 
 	var additionalLabels []string
 	for _, key := range v1.AdditionalCheckMetricLabels {
-		if v, ok := result.Check.GetLabels()[key]; ok {
+		if v, ok := result.Labels[key]; ok {
 			additionalLabels = append(additionalLabels, v)
 		} else {
 			// just insert an empty value

@@ -276,7 +276,7 @@ func RunChecks(ctx *context.Context) ([]*pkg.CheckResult, RunChecksMeta, error) 
 			filteredResults, skippedCount := runCheckWithRetries(ctx, checker, check)
 			meta.SecretLookupRateLimitSkipped += skippedCount
 			results = append(results, filteredResults...)
-			ExportCheckMetrics(ctx, filteredResults, true)
+			ExportOrDeferCheckMetrics(ctx, filteredResults, true)
 
 			if check.GetName() != "" && len(filteredResults) > 0 && filteredResults[0].Pass {
 				ctx.SetOutput(check.GetName(), filteredResults[0])
@@ -292,17 +292,28 @@ func RunChecks(ctx *context.Context) ([]*pkg.CheckResult, RunChecksMeta, error) 
 				filteredResults, skippedCount := runCheckWithRetries(ctx, c, check)
 				meta.SecretLookupRateLimitSkipped += skippedCount
 				results = append(results, filteredResults...)
-				ExportCheckMetrics(ctx, filteredResults, true)
+				ExportOrDeferCheckMetrics(ctx, filteredResults, true)
 			}
 		}
 	}
 
+	gated := ctx.Publication != nil
 	if err := saveArtifacts(ctx, results); err != nil {
+		if gated {
+			// Attachments are part of the bound publication: incomplete or
+			// unverifiable content must prevent this round's results from
+			// taking effect.
+			return nil, meta, err
+		}
 		ctx.Errorf("error saving artifacts: %v", err)
 	}
 
 	if ctx.HARCollector != nil && len(ctx.HARCollector.Entries()) > 0 {
-		if err := saveHAR(ctx); err != nil {
+		if gated {
+			if err := stageHARToPublication(ctx); err != nil {
+				return nil, meta, err
+			}
+		} else if err := saveHAR(ctx); err != nil {
 			ctx.Errorf("error saving HAR: %v", err)
 		}
 	}
@@ -316,6 +327,11 @@ func saveArtifacts(ctx *context.Context, results pkg.Results) error {
 	}
 
 	if DefaultArtifactConnection == "" {
+		if ctx.Publication != nil {
+			// The run must be published with its attachments; without an
+			// object store there is nothing verifiable to bind.
+			return fmt.Errorf("cannot stage %d artifacts: no artifact connection configured", results.TotalArtifacts())
+		}
 		ctx.Warnf("no artifact connection configured")
 		return nil
 	}
@@ -325,6 +341,13 @@ func saveArtifacts(ctx *context.Context, results pkg.Results) error {
 		return fmt.Errorf("error getting connection(%s): %w", DefaultArtifactConnection, err)
 	} else if connection == nil {
 		return fmt.Errorf("connection(%s) was not found", DefaultArtifactConnection)
+	}
+
+	if ctx.Publication != nil {
+		// The publication owns the upload, checksum verification and
+		// manifest; the artifacts metadata rows are written as part of the
+		// publication's commit transaction.
+		return ctx.Publication.StageArtifacts(ctx.Context, *connection, results)
 	}
 
 	fs, err := artifacts.GetFSForConnection(ctx.Context, *connection)
@@ -361,12 +384,18 @@ func saveArtifacts(ctx *context.Context, results pkg.Results) error {
 	return nil
 }
 
-func saveHAR(ctx *context.Context) error {
-	location := ctx.Properties().String("http.har.location", ".")
+func stageHARToPublication(ctx *context.Context) error {
+	data, err := renderHAR(ctx)
+	if err != nil {
+		return err
+	}
 	filename := fmt.Sprintf("%s_%s_%d.har",
-		ctx.Canary.Namespace, ctx.Canary.Name, time.Now().UnixMilli())
-	path := filepath.Join(location, filename)
+		ctx.Canary.Namespace, ctx.Canary.Name, ctx.Publication.RunTime().UnixMilli())
+	ctx.Publication.StageHAR(data, filename)
+	return nil
+}
 
+func renderHAR(ctx *context.Context) ([]byte, error) {
 	harFile := har.File{
 		Log: har.Log{
 			Version: "1.2",
@@ -374,11 +403,23 @@ func saveHAR(ctx *context.Context) error {
 			Entries: ctx.HARCollector.Entries(),
 		},
 	}
-
 	data, err := json.MarshalIndent(harFile, "", "  ")
 	if err != nil {
-		return fmt.Errorf("error marshaling HAR: %w", err)
+		return nil, fmt.Errorf("error marshaling HAR: %w", err)
 	}
+	return data, nil
+}
+
+func saveHAR(ctx *context.Context) error {
+	data, err := renderHAR(ctx)
+	if err != nil {
+		return err
+	}
+
+	location := ctx.Properties().String("http.har.location", ".")
+	filename := fmt.Sprintf("%s_%s_%d.har",
+		ctx.Canary.Namespace, ctx.Canary.Name, time.Now().UnixMilli())
+	path := filepath.Join(location, filename)
 
 	if err := os.MkdirAll(location, 0o755); err != nil {
 		return fmt.Errorf("error creating HAR directory %s: %w", location, err)
@@ -388,7 +429,7 @@ func saveHAR(ctx *context.Context) error {
 		return fmt.Errorf("error writing HAR file %s: %w", path, err)
 	}
 
-	ctx.Infof("HAR saved to %s (%d entries)", path, len(harFile.Log.Entries))
+	ctx.Infof("HAR saved to %s (%d entries)", path, len(ctx.HARCollector.Entries()))
 	return nil
 }
 

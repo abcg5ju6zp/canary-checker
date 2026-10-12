@@ -1,4 +1,4 @@
-package canary
+package publication
 
 import (
 	"fmt"
@@ -17,22 +17,48 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 )
 
-func UpdateCanaryStatusAndEvent(ctx context.Context, canary v1.Canary, results []*pkg.CheckResult, now time.Time) {
-	if CanaryStatusChannel == nil {
+// K8sStatusChannel receives canary status updates for the kubernetes
+// controller. nil means canary status reporting is disabled (e.g. running
+// outside the operator), matching the previous behavior.
+var K8sStatusChannel chan K8sStatusPayload
+
+type K8sStatusPayload struct {
+	Status               v1.CanaryStatusCondition
+	CheckStatus          map[string]*v1.CheckStatus
+	FailEvents           []string
+	LastTransitionedTime *metav1.Time
+	Message              string
+	ErrorMessage         string
+	Uptime               string
+	Latency              string
+	NamespacedName       types.NamespacedName
+
+	// PublicationID ties this payload to a bound publication so a failed
+	// status patch can reset only the kubernetes output confirmation.
+	PublicationID string
+}
+
+func k8sApplicable(canary v1.Canary) bool {
+	return K8sStatusChannel != nil && strings.HasPrefix(canary.Annotations["source"], "kubernetes")
+}
+
+// PublishK8sStatusLegacy reproduces the pre-publication behavior for runs
+// without artifacts/HAR: aggregate metrics are recorded and the status
+// payload is sent unconditionally (no replay bookkeeping).
+func PublishK8sStatusLegacy(ctx context.Context, canary v1.Canary, results []*pkg.CheckResult, now time.Time) {
+	if len(results) == 0 || !k8sApplicable(canary) {
 		return
 	}
+	payload := BuildK8sStatusPayload(ctx, canary, results, now, "")
+	K8sStatusChannel <- payload
+}
 
-	if len(results) == 0 {
-		return
-	}
-
-	// Skip function if canary is not sourced from Kubernetes CRD
-	if !strings.HasPrefix(canary.Annotations["source"], "kubernetes") {
-		return
-	}
-
+// BuildK8sStatusPayload aggregates the run results into the CRD status
+// payload. Recording aggregate canary metrics is part of building the
+// payload and therefore happens exactly once per run (the metrics output
+// winner of a bound publication).
+func BuildK8sStatusPayload(ctx context.Context, canary v1.Canary, results []*pkg.CheckResult, now time.Time, publicationID string) K8sStatusPayload {
 	var checkStatus = make(map[string]*v1.CheckStatus)
-	var duration int64
 	var messages, errorMsgs []string
 	var failEvents []string
 	var status v1.CanaryStatusCondition
@@ -41,9 +67,6 @@ func UpdateCanaryStatusAndEvent(ctx context.Context, canary v1.Canary, results [
 	var uptimeAgg dutyTypes.Uptime
 
 	for _, result := range results {
-		// Increment duration
-		duration += result.Duration
-
 		// Set uptime and latency
 		uptime, latency := metrics.Record(ctx, canary, result)
 		checkID := canary.Status.Checks[result.Check.GetName()]
@@ -62,12 +85,6 @@ func UpdateCanaryStatusAndEvent(ctx context.Context, canary v1.Canary, results [
 		}
 
 		transitioned := false
-		// Transition
-		// q := query.CheckQueryParams{Check: checkID, StatusCount: 1}
-		// if canary.Status.LastTransitionedTime != nil {
-		// 	q.Start = canary.Status.LastTransitionedTime.Format(time.RFC3339)
-		// }
-
 		latestCheckStatus, err := db.LatestCheckStatus(ctx, checkID, now)
 		if err != nil || latestCheckStatus == nil {
 			transitioned = true
@@ -113,7 +130,7 @@ func UpdateCanaryStatusAndEvent(ctx context.Context, canary v1.Canary, results [
 		msg = fmt.Sprintf("%s, (%d more)", messages[0], len(messages)-1)
 	}
 
-	payload := CanaryStatusPayload{
+	return K8sStatusPayload{
 		Status:               status,
 		CheckStatus:          checkStatus,
 		FailEvents:           failEvents,
@@ -123,19 +140,6 @@ func UpdateCanaryStatusAndEvent(ctx context.Context, canary v1.Canary, results [
 		Uptime:               uptimeAgg.String(),
 		Latency:              utils.Age(time.Duration(highestLatency) * time.Millisecond),
 		NamespacedName:       canary.GetNamespacedName(),
+		PublicationID:        publicationID,
 	}
-
-	CanaryStatusChannel <- payload
-}
-
-type CanaryStatusPayload struct {
-	Status               v1.CanaryStatusCondition
-	CheckStatus          map[string]*v1.CheckStatus
-	FailEvents           []string
-	LastTransitionedTime *metav1.Time
-	Message              string
-	ErrorMessage         string
-	Uptime               string
-	Latency              string
-	NamespacedName       types.NamespacedName
 }

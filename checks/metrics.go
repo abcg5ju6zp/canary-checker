@@ -88,26 +88,75 @@ func ExportCheckMetrics(ctx *context.Context, results pkg.Results, exportResultM
 	}
 
 	for _, r := range results {
-		checkCtx := ctx.WithCheckResult(r)
-		for _, metric := range r.Metrics {
-			if exportResultMetrics {
-				if err := exportMetric(checkCtx, metric); err != nil {
-					r.ErrorMessage(err)
-				}
-			}
-		}
-		for _, spec := range r.Check.GetMetricsSpec() {
-			if spec.Name == "" || spec.Value == "" {
-				continue
-			}
+		evaluated := EvaluateCheckMetrics(ctx, r, exportResultMetrics)
+		EmitEvaluatedMetrics(ctx, r, evaluated)
+	}
+}
 
-			if metric, err := templateMetrics(checkCtx, spec); err != nil {
-				r.ErrorMessage(err)
-			} else if err := exportMetric(checkCtx, *metric); err != nil {
-				r.ErrorMessage(err)
-			}
+// EvaluateCheckMetrics evaluates the metrics due for one result: result
+// attached metrics (when exportResultMetrics) plus the check spec's
+// templated metrics. Error side effects on the result are preserved. A run
+// bound to a recoverable publication sinks these metrics and emits them only
+// after its database commit is confirmed.
+func EvaluateCheckMetrics(ctx *context.Context, r *pkg.CheckResult, exportResultMetrics bool) []pkg.Metric {
+	var evaluated []pkg.Metric
+	checkCtx := ctx.WithCheckResult(r)
+	if exportResultMetrics {
+		evaluated = append(evaluated, r.Metrics...)
+	}
+	for _, spec := range r.Check.GetMetricsSpec() {
+		if spec.Name == "" || spec.Value == "" {
+			continue
+		}
+
+		if metric, err := templateMetrics(checkCtx, spec); err != nil {
+			r.ErrorMessage(err)
+		} else {
+			evaluated = append(evaluated, *metric)
 		}
 	}
+	return evaluated
+}
+
+// EmitEvaluatedMetrics publishes metrics previously produced by
+// EvaluateCheckMetrics. It is called directly on the legacy path and once,
+// after commit, on the publication path.
+func EmitEvaluatedMetrics(ctx *context.Context, r *pkg.CheckResult, evaluated []pkg.Metric) {
+	if len(evaluated) == 0 {
+		return
+	}
+	checkCtx := ctx.WithCheckResult(r)
+	for _, metric := range evaluated {
+		if err := exportMetric(checkCtx, metric); err != nil {
+			r.ErrorMessage(err)
+		}
+	}
+}
+
+// EmitMetrics publishes an already-evaluated flat metric set. It is used by
+// recovered publications replaying the metrics output, where the original
+// result objects no longer exist.
+func EmitMetrics(ctx *context.Context, metrics []pkg.Metric) {
+	for _, metric := range metrics {
+		if err := exportMetric(ctx, metric); err != nil {
+			ctx.Errorf("error emitting metric %s: %v", metric.Name, err)
+		}
+	}
+}
+
+// ExportOrDeferCheckMetrics exports check metrics immediately, or sinks them
+// into the run's publication when one is attached.
+func ExportOrDeferCheckMetrics(ctx *context.Context, results pkg.Results, exportResultMetrics bool) {
+	if len(results) == 0 {
+		return
+	}
+	if ctx.Publication != nil && ctx.Publication.DeferMetricsExports() {
+		for _, r := range results {
+			ctx.Publication.RecordEvaluatedMetrics(r, EvaluateCheckMetrics(ctx, r, exportResultMetrics))
+		}
+		return
+	}
+	ExportCheckMetrics(ctx, results, exportResultMetrics)
 }
 
 func templateMetrics(ctx *context.Context, spec external.Metrics) (*pkg.Metric, error) {

@@ -32,6 +32,7 @@ import (
 	v1 "github.com/flanksource/canary-checker/api/v1"
 	"github.com/flanksource/canary-checker/pkg"
 	canaryJobs "github.com/flanksource/canary-checker/pkg/jobs/canary"
+	"github.com/flanksource/canary-checker/pkg/publication"
 	"github.com/flanksource/canary-checker/pkg/runner"
 	dutyContext "github.com/flanksource/duty/context"
 	"github.com/go-logr/logr"
@@ -262,11 +263,16 @@ func hasCanaryChanged(canary *v1.Canary, dbCanary *pkg.Canary) (bool, error) {
 }
 
 func (r *CanaryReconciler) Report() {
-	for payload := range canaryJobs.CanaryStatusChannel {
+	for payload := range publication.K8sStatusChannel {
 		var canary v1.Canary
 		err := r.Get(gocontext.Background(), payload.NamespacedName, &canary)
 		if err != nil {
 			r.Log.Error(err, "failed to get canary while reporting", "canary", payload.NamespacedName)
+			// The canary is gone: its status output has nowhere to go, so
+			// confirm it rather than replaying it on every sweep.
+			if payload.PublicationID != "" && k8sErrs.IsNotFound(err) {
+				publication.MarkK8sStatusConfirmed(r.Context, payload.PublicationID)
+			}
 			continue
 		}
 
@@ -299,6 +305,12 @@ func (r *CanaryReconciler) Report() {
 
 		if err := r.Status().Patch(gocontext.Background(), &canary, patch); err != nil {
 			r.Log.Error(err, "failed to update status", "canary", canary.Name)
+			// For bound publications, release only the kubernetes status
+			// confirmation so the sweeper replays this one output without
+			// replaying details, artifacts or counters.
+			if payload.PublicationID != "" {
+				publication.MarkK8sStatusPending(r.Context, payload.PublicationID)
+			}
 		}
 	}
 }

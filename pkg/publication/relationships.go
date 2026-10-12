@@ -1,4 +1,4 @@
-package canary
+package publication
 
 import (
 	"fmt"
@@ -88,7 +88,7 @@ func FormCheckRelationships(ctx context.Context, result *pkg.CheckResult) error 
 	for _, lookupSpec := range relationshipConfig.Configs {
 		configIDs, err := duty.LookupConfigs(ctx, lookupSpec, result.Labels, map[string]any{"result": result})
 		if err != nil {
-			ctx.Error(err, "error finding config items (check=%s) (lookup=%v)", checkID, lookupSpec)
+			ctx.Error(err, "error finding config items (check=%s) (lookup=%v)", checkID, lookupSpec, err)
 			continue
 		}
 

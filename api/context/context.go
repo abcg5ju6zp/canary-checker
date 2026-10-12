@@ -27,6 +27,12 @@ type Context struct {
 	cache        map[string]any
 	Outputs      map[string]*pkg.CheckResult
 	HARCollector *har.Collector
+
+	// Publication, when set, binds this run's artifacts, HAR, metrics and
+	// persisted results to a recoverable publication record. See
+	// pkg.RunPublicationHooks.
+	Publication pkg.RunPublicationHooks
+
 	dutyCtx.Context
 }
 
@@ -304,5 +310,6 @@ func (ctx *Context) New(name string, environment map[string]interface{}) *Contex
 		Canary:      ctx.Canary,
 		Environment: environment,
 		Outputs:     ctx.Outputs,
+		Publication: ctx.Publication,
 	}
 }
