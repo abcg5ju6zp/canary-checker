@@ -22,6 +22,7 @@ import (
 	"github.com/flanksource/canary-checker/pkg/runner"
 
 	"github.com/flanksource/canary-checker/pkg/cache"
+	"github.com/flanksource/canary-checker/pkg/webhook"
 	"github.com/flanksource/commons/logger"
 	dutyApi "github.com/flanksource/duty/api"
 	dutyEcho "github.com/flanksource/duty/echo"
@@ -65,6 +66,10 @@ func setupDefaultContext() error {
 	apicontext.DefaultContext = apicontext.DefaultContext.WithNamespace(runner.WatchNamespace)
 
 	cache.PostgresCache = cache.NewPostgresCache(apicontext.DefaultContext)
+
+	if err := webhook.EnsureSchema(apicontext.DefaultContext); err != nil {
+		return fmt.Errorf("failed to ensure webhook delivery schema: %w", err)
+	}
 
 	return nil
 }

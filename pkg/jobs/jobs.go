@@ -8,6 +8,7 @@ import (
 	topologyJobs "github.com/flanksource/canary-checker/pkg/jobs/topology"
 	"github.com/flanksource/canary-checker/pkg/runner"
 	"github.com/flanksource/canary-checker/pkg/topology"
+	"github.com/flanksource/canary-checker/pkg/webhook"
 	"github.com/flanksource/commons/logger"
 	"github.com/flanksource/commons/properties"
 	dutyEcho "github.com/flanksource/duty/echo"
@@ -59,6 +60,7 @@ func Start() {
 		canaryJobs.CleanupDeletedCanaryChecks,
 		canaryJobs.VacuumCanaryTables, canaryJobs.DeleteTransformedCanaries,
 		canaryJobs.SyncAgentSelectorCanaries, canaryJobs.CleanupOrphanedAgentSelectorCanaries,
+		webhook.RecoveryJob,
 	}
 	for _, j := range miscJobs {
 		job := j

@@ -213,10 +213,21 @@ func TruncateError(s string) string {
 }
 
 func CheckStatusFromResult(result CheckResult) CheckStatus {
+	statusTime := time.Now().UTC()
+	layout := time.RFC3339
+	if !result.StatusTime.IsZero() {
+		statusTime = result.StatusTime.UTC()
+		// Idempotent delivery pins the status time per event: nanosecond
+		// precision keeps distinct events arriving in the same second from
+		// collapsing onto one check_statuses row, while redeliveries reuse
+		// the receipt time and stay deduplicated.
+		layout = time.RFC3339Nano
+	}
+
 	cs := CheckStatus{
 		Status:  result.Pass,
 		Invalid: result.Invalid,
-		Time:    time.Now().UTC().Format(time.RFC3339),
+		Time:    statusTime.Format(layout),
 		Message: TruncateMessage(result.Message),
 		Error:   TruncateError(result.Error),
 		Detail:  result.Detail,
@@ -347,8 +358,12 @@ type ArtifactResult struct {
 }
 
 type CheckResult struct {
-	Name        string                 `json:"name,omitempty"`
-	Start       time.Time              `json:"start,omitempty"`
+	Name  string    `json:"name,omitempty"`
+	Start time.Time `json:"start,omitempty"`
+	// StatusTime pins the timestamp of the persisted check status. It is set
+	// by idempotent delivery paths so retries/replays reuse the same status
+	// row. When zero, the current time is used.
+	StatusTime  time.Time              `json:"-"`
 	Pass        bool                   `json:"pass,omitempty"`
 	Invalid     bool                   `json:"invalid,omitempty"`
 	Detail      interface{}            `json:"detail,omitempty"`

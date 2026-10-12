@@ -10,6 +10,7 @@ import (
 	"github.com/flanksource/canary-checker/pkg"
 	"github.com/flanksource/canary-checker/pkg/cache"
 	"github.com/flanksource/canary-checker/pkg/db"
+	webhookdelivery "github.com/flanksource/canary-checker/pkg/webhook"
 	"github.com/flanksource/duty/api"
 	dutyContext "github.com/flanksource/duty/context"
 	"github.com/labstack/echo/v4"
@@ -17,11 +18,10 @@ import (
 
 const webhookBodyLimit = 10 * 1024 // 10 MB
 
-type CheckData struct {
-	Headers map[string]string `json:"headers"`
-	JSON    map[string]any    `json:"json,omitempty"`
-	Content string            `json:"content,omitempty"`
-}
+// CheckData is the parsed webhook payload. It is shared with the idempotent
+// delivery package so transformation templates see the exact same value type
+// on both the legacy and convergent paths.
+type CheckData = webhookdelivery.Payload
 
 func WebhookHandler(c echo.Context) error {
 	id := c.Param("id")
@@ -31,36 +31,49 @@ func WebhookHandler(c echo.Context) error {
 		authToken = c.Request().Header.Get("Webhook-Token")
 	}
 
-	data := CheckData{
-		Headers: make(map[string]string),
-	}
+	headers := make(map[string]string)
 	for k := range c.Request().Header {
-		data.Headers[k] = c.Request().Header.Get(k)
+		headers[k] = c.Request().Header.Get(k)
 	}
 
-	if c.Request().Header.Get("Content-Type") == "application/json" {
-		if err := json.NewDecoder(c.Request().Body).Decode(&data.JSON); err != nil {
-			return api.WriteError(c, err)
-		}
-	} else {
-		b, err := io.ReadAll(io.LimitReader(c.Request().Body, webhookBodyLimit))
-		if err != nil {
-			return api.WriteError(c, err)
-		}
-
-		data.Content = string(b)
+	// Restricted read: the raw payload is bounded regardless of content type.
+	raw, err := io.ReadAll(io.LimitReader(c.Request().Body, webhookBodyLimit))
+	if err != nil {
+		return api.WriteError(c, err)
 	}
 
 	ctx := c.Request().Context().(dutyContext.Context)
 
-	if err := webhookHandler(ctx, id, authToken, data); err != nil {
+	if c.Request().Header.Get("Content-Type") == "application/json" {
+		var parsed map[string]any
+		if err := json.Unmarshal(raw, &parsed); err != nil {
+			return api.WriteError(c, err)
+		}
+
+		err = webhookdelivery.Ingest(ctx, id, authToken, webhookdelivery.Payload{
+			Headers: headers,
+			JSON:    parsed,
+		}, raw)
+		if err != nil {
+			return api.WriteError(c, err)
+		}
+
+		return c.JSON(http.StatusOK, &api.HTTPSuccess{Message: "ok"})
+	}
+
+	// Non-JSON payloads keep the legacy one-shot processing behavior.
+	data := CheckData{Headers: headers, Content: string(raw)}
+	if err := webhookHandlerLegacy(ctx, id, authToken, data); err != nil {
 		return api.WriteError(c, err)
 	}
 
 	return c.JSON(http.StatusOK, &api.HTTPSuccess{Message: "ok"})
 }
 
-func webhookHandler(ctx dutyContext.Context, id, authToken string, data CheckData) error {
+// webhookHandlerLegacy is the original one-shot conversion and persistence
+// path, retained for payloads that do not participate in idempotent delivery
+// (non-JSON bodies).
+func webhookHandlerLegacy(ctx dutyContext.Context, id, authToken string, data CheckData) error {
 	canaries, err := db.FindCanariesByWebhook(ctx, id)
 	if err != nil {
 		return err
